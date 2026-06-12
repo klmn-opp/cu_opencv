@@ -8,9 +8,10 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
+from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Float32MultiArray
 
 
@@ -25,6 +26,14 @@ class DetectionResult:
     bbox_h: int
     contour_points: int
     vertex_count: int
+
+
+@dataclass
+class PnPResult:
+    rvec: np.ndarray
+    tvec: np.ndarray
+    reprojection_error: float
+    image_points: np.ndarray
 
 
 def odd_kernel(size: int) -> np.ndarray:
@@ -108,7 +117,7 @@ def contour_score(
     if solidity < min_solidity:
         return -1.0, approx
 
-    x, y, w, h = cv2.boundingRect(approx)
+    _, _, w, h = cv2.boundingRect(approx)
     if h <= 0:
         return -1.0, approx
 
@@ -162,10 +171,109 @@ def contour_center(contour: np.ndarray, approx: Optional[np.ndarray]) -> Optiona
     )
 
 
+def find_pentagon_approx(contour: np.ndarray, base_epsilon_ratio: float) -> Optional[np.ndarray]:
+    perimeter = cv2.arcLength(contour, True)
+    if perimeter <= 1e-6:
+        return None
+    ratios = [
+        base_epsilon_ratio,
+        0.02,
+        0.025,
+        0.03,
+        0.035,
+        0.04,
+        0.05,
+        0.06,
+    ]
+    seen = set()
+    for ratio in ratios:
+        key = round(float(ratio), 4)
+        if key in seen:
+            continue
+        seen.add(key)
+        approx = cv2.approxPolyDP(contour, ratio * perimeter, True)
+        if len(approx) == 5:
+            return approx
+    return None
+
+
+def polygon_centroid(points: np.ndarray) -> np.ndarray:
+    x = points[:, 0]
+    y = points[:, 1]
+    cross = x * np.roll(y, -1) - np.roll(x, -1) * y
+    area = 0.5 * np.sum(cross)
+    if abs(area) < 1e-9:
+        return np.mean(points, axis=0)
+    cx = np.sum((x + np.roll(x, -1)) * cross) / (6.0 * area)
+    cy = np.sum((y + np.roll(y, -1)) * cross) / (6.0 * area)
+    return np.array([cx, cy], dtype=np.float32)
+
+
+def house_object_points(side_m: float) -> np.ndarray:
+    tri_h = math.sqrt(3.0) * side_m / 2.0
+    pts_2d = np.array(
+        [
+            [0.0, side_m + tri_h],
+            [side_m / 2.0, side_m],
+            [side_m / 2.0, 0.0],
+            [-side_m / 2.0, 0.0],
+            [-side_m / 2.0, side_m],
+        ],
+        dtype=np.float32,
+    )
+    centroid = polygon_centroid(pts_2d)
+    pts_2d = pts_2d - centroid
+    return np.column_stack([pts_2d, np.zeros(5, dtype=np.float32)]).astype(np.float32)
+
+
+def pentagon_point_orders(approx: np.ndarray) -> list[np.ndarray]:
+    pts = approx.reshape(-1, 2).astype(np.float32)
+    center = np.mean(pts, axis=0)
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+    ring = pts[np.argsort(angles)]
+    apex_idx = int(np.argmax(np.linalg.norm(ring - center, axis=1)))
+    order = np.roll(ring, -apex_idx, axis=0)
+    reversed_order = np.concatenate([order[:1], order[:0:-1]], axis=0)
+    return [order.astype(np.float32), reversed_order.astype(np.float32)]
+
+
+def rotation_matrix_to_quaternion(rotation: np.ndarray) -> tuple[float, float, float, float]:
+    trace = float(np.trace(rotation))
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (rotation[2, 1] - rotation[1, 2]) / s
+        qy = (rotation[0, 2] - rotation[2, 0]) / s
+        qz = (rotation[1, 0] - rotation[0, 1]) / s
+    else:
+        idx = int(np.argmax(np.diag(rotation)))
+        if idx == 0:
+            s = math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+            qw = (rotation[2, 1] - rotation[1, 2]) / s
+            qx = 0.25 * s
+            qy = (rotation[0, 1] + rotation[1, 0]) / s
+            qz = (rotation[0, 2] + rotation[2, 0]) / s
+        elif idx == 1:
+            s = math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+            qw = (rotation[0, 2] - rotation[2, 0]) / s
+            qx = (rotation[0, 1] + rotation[1, 0]) / s
+            qy = 0.25 * s
+            qz = (rotation[1, 2] + rotation[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+            qw = (rotation[1, 0] - rotation[0, 1]) / s
+            qx = (rotation[0, 2] + rotation[2, 0]) / s
+            qy = (rotation[1, 2] + rotation[2, 1]) / s
+            qz = 0.25 * s
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    return qx / norm, qy / norm, qz / norm, qw / norm
+
+
 class TargetDetector(Node):
     def __init__(self) -> None:
         super().__init__("target_detector")
         self.declare_parameter("image_topic", "/image_raw")
+        self.declare_parameter("camera_info_topic", "/camera_info")
         self.declare_parameter("target_color", "red")
         self.declare_parameter("min_area", 150.0)
         self.declare_parameter("display", False)
@@ -181,11 +289,26 @@ class TargetDetector(Node):
         self.declare_parameter("min_vertices", 4)
         self.declare_parameter("max_vertices", 7)
         self.declare_parameter("min_solidity", 0.65)
+        self.declare_parameter("filter_enable", True)
+        self.declare_parameter("min_confirm_frames", 3)
+        self.declare_parameter("max_missed_frames", 5)
+        self.declare_parameter("filter_alpha", 0.35)
+        self.declare_parameter("max_center_jump_px", 220.0)
+        self.declare_parameter("enable_pnp", True)
+        self.declare_parameter("target_side_m", 1.0)
+        self.declare_parameter("max_reprojection_error_px", 8.0)
+        self.declare_parameter("camera_fx", 0.0)
+        self.declare_parameter("camera_fy", 0.0)
+        self.declare_parameter("camera_cx", 0.0)
+        self.declare_parameter("camera_cy", 0.0)
 
         self.bridge = CvBridge()
         self.last_detection: Optional[DetectionResult] = None
+        self.camera_matrix: Optional[np.ndarray] = None
+        self.dist_coeffs = np.zeros((5, 1), dtype=np.float64)
 
         image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
+        camera_info_topic = self.get_parameter("camera_info_topic").get_parameter_value().string_value
         self.target_color = self.get_parameter("target_color").get_parameter_value().string_value
         self.min_area = float(self.get_parameter("min_area").value)
         self.display = bool(self.get_parameter("display").value)
@@ -201,18 +324,146 @@ class TargetDetector(Node):
         self.min_vertices = int(self.get_parameter("min_vertices").value)
         self.max_vertices = int(self.get_parameter("max_vertices").value)
         self.min_solidity = float(self.get_parameter("min_solidity").value)
+        self.filter_enable = bool(self.get_parameter("filter_enable").value)
+        self.min_confirm_frames = int(self.get_parameter("min_confirm_frames").value)
+        self.max_missed_frames = int(self.get_parameter("max_missed_frames").value)
+        self.filter_alpha = float(self.get_parameter("filter_alpha").value)
+        self.max_center_jump_px = float(self.get_parameter("max_center_jump_px").value)
+        self.enable_pnp = bool(self.get_parameter("enable_pnp").value)
+        self.target_side_m = float(self.get_parameter("target_side_m").value)
+        self.max_reprojection_error_px = float(self.get_parameter("max_reprojection_error_px").value)
+
+        fx = float(self.get_parameter("camera_fx").value)
+        fy = float(self.get_parameter("camera_fy").value)
+        cx = float(self.get_parameter("camera_cx").value)
+        cy = float(self.get_parameter("camera_cy").value)
+        if fx > 0.0 and fy > 0.0:
+            self.camera_matrix = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+        self.object_points = house_object_points(self.target_side_m)
+        self.filtered_center: Optional[np.ndarray] = None
+        self.filtered_tvec: Optional[np.ndarray] = None
+        self.filtered_rvec: Optional[np.ndarray] = None
+        self.hit_count = 0
+        self.missed_count = 0
 
         self.sub = self.create_subscription(Image, image_topic, self.image_callback, qos_profile_sensor_data)
+        self.camera_info_sub = self.create_subscription(
+            CameraInfo, camera_info_topic, self.camera_info_callback, qos_profile_sensor_data
+        )
         self.center_pub = self.create_publisher(Float32MultiArray, "target_center_px", 10)
+        self.filtered_center_pub = self.create_publisher(Float32MultiArray, "target_center_px_filtered", 10)
+        self.pose_pub = self.create_publisher(PoseStamped, "target_pose_camera", 10)
         self.mask_pub = self.create_publisher(Image, "target_mask", qos_profile_sensor_data)
         self.shape_mask_pub = self.create_publisher(Image, "target_shape_mask", qos_profile_sensor_data)
         self.debug_pub = self.create_publisher(Image, "target_debug", qos_profile_sensor_data)
 
         self.get_logger().info(
             f"listening on {image_topic}, target_color={self.target_color}, min_area={self.min_area}, "
-            f"shape_epsilon_ratio={self.shape_epsilon_ratio}, hsv_s_min={self.hsv_s_min}, "
-            f"hsv_v_min={self.hsv_v_min}, channel_delta={self.channel_delta}"
+            f"filter_enable={self.filter_enable}, enable_pnp={self.enable_pnp}"
         )
+
+    def camera_info_callback(self, msg: CameraInfo) -> None:
+        if self.camera_matrix is not None:
+            return
+        self.camera_matrix = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        self.dist_coeffs = np.array(msg.d, dtype=np.float64).reshape(-1, 1) if msg.d else np.zeros((5, 1), dtype=np.float64)
+        self.get_logger().info("camera intrinsics received from CameraInfo")
+
+    def update_filter(self, result: Optional[DetectionResult], pnp: Optional[PnPResult]) -> bool:
+        if result is None:
+            self.missed_count += 1
+            if self.missed_count > self.max_missed_frames:
+                self.filtered_center = None
+                self.filtered_tvec = None
+                self.filtered_rvec = None
+                self.hit_count = 0
+            return False
+
+        center = np.array([result.center_x, result.center_y], dtype=np.float64)
+        if self.filtered_center is not None and self.max_center_jump_px > 0.0:
+            jump = float(np.linalg.norm(center - self.filtered_center))
+            if self.hit_count >= self.min_confirm_frames and jump > self.max_center_jump_px:
+                self.missed_count += 1
+                return False
+
+        alpha = min(max(self.filter_alpha, 0.0), 1.0)
+        if self.filtered_center is None or self.missed_count > self.max_missed_frames:
+            self.filtered_center = center
+        else:
+            self.filtered_center = alpha * center + (1.0 - alpha) * self.filtered_center
+
+        if pnp is not None:
+            if self.filtered_tvec is None or self.filtered_rvec is None:
+                self.filtered_tvec = pnp.tvec.astype(np.float64)
+                self.filtered_rvec = pnp.rvec.astype(np.float64)
+            else:
+                self.filtered_tvec = alpha * pnp.tvec + (1.0 - alpha) * self.filtered_tvec
+                self.filtered_rvec = alpha * pnp.rvec + (1.0 - alpha) * self.filtered_rvec
+
+        self.hit_count += 1
+        self.missed_count = 0
+        return self.hit_count >= self.min_confirm_frames
+
+    def solve_target_pnp(self, contour: np.ndarray) -> Optional[PnPResult]:
+        if not self.enable_pnp or self.camera_matrix is None:
+            return None
+
+        pentagon = find_pentagon_approx(contour, self.shape_epsilon_ratio)
+        if pentagon is None:
+            return None
+
+        best: Optional[PnPResult] = None
+        for image_points in pentagon_point_orders(pentagon):
+            ok, rvec, tvec = cv2.solvePnP(
+                self.object_points,
+                image_points,
+                self.camera_matrix,
+                self.dist_coeffs,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            if not ok:
+                continue
+            projected, _ = cv2.projectPoints(self.object_points, rvec, tvec, self.camera_matrix, self.dist_coeffs)
+            projected = projected.reshape(-1, 2)
+            error = float(np.mean(np.linalg.norm(projected - image_points, axis=1)))
+            if error > self.max_reprojection_error_px:
+                continue
+            if best is None or error < best.reprojection_error:
+                best = PnPResult(rvec=rvec, tvec=tvec, reprojection_error=error, image_points=image_points)
+        return best
+
+    def publish_filtered_center(self, result: DetectionResult) -> None:
+        if self.filtered_center is None:
+            return
+        msg = Float32MultiArray()
+        msg.data = [
+            float(self.filtered_center[0]),
+            float(self.filtered_center[1]),
+            float(result.area),
+            float(result.vertex_count),
+            float(self.hit_count),
+        ]
+        self.filtered_center_pub.publish(msg)
+
+    def publish_pose(self, header, pnp: Optional[PnPResult]) -> None:
+        if pnp is None or self.filtered_tvec is None or self.filtered_rvec is None:
+            return
+        rotation, _ = cv2.Rodrigues(self.filtered_rvec)
+        qx, qy, qz, qw = rotation_matrix_to_quaternion(rotation)
+
+        msg = PoseStamped()
+        msg.header = header
+        if not msg.header.frame_id:
+            msg.header.frame_id = "camera"
+        msg.pose.position.x = float(self.filtered_tvec[0])
+        msg.pose.position.y = float(self.filtered_tvec[1])
+        msg.pose.position.z = float(self.filtered_tvec[2])
+        msg.pose.orientation.x = qx
+        msg.pose.orientation.y = qy
+        msg.pose.orientation.z = qz
+        msg.pose.orientation.w = qw
+        self.pose_pub.publish(msg)
 
     def image_callback(self, msg: Image) -> None:
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -241,13 +492,20 @@ class TargetDetector(Node):
 
         debug = frame.copy()
         shape_mask = np.zeros(mask.shape, dtype=np.uint8)
-        out = Float32MultiArray()
+        result = None
+        pnp = None
+
         if contour is not None:
             result = contour_center(contour, approx)
             if result is not None:
+                pnp = self.solve_target_pnp(contour)
                 cv2.drawContours(shape_mask, [contour], -1, 255, thickness=cv2.FILLED)
                 self.last_detection = result
-                out.data = [result.center_x, result.center_y, result.area, float(result.vertex_count)]
+
+                raw_msg = Float32MultiArray()
+                raw_msg.data = [result.center_x, result.center_y, result.area, float(result.vertex_count)]
+                self.center_pub.publish(raw_msg)
+
                 cv2.rectangle(
                     debug,
                     (result.bbox_x, result.bbox_y),
@@ -258,6 +516,9 @@ class TargetDetector(Node):
                 cv2.circle(debug, (int(round(result.center_x)), int(round(result.center_y))), 5, (0, 255, 255), -1)
                 if approx is not None and len(approx) >= 2:
                     cv2.polylines(debug, [approx], True, (255, 0, 0), 2)
+                if pnp is not None:
+                    for point in pnp.image_points:
+                        cv2.circle(debug, (int(point[0]), int(point[1])), 4, (255, 255, 0), -1)
                 cv2.putText(
                     debug,
                     f"({result.center_x:.1f}, {result.center_y:.1f}) area={result.area:.0f} v={result.vertex_count}",
@@ -268,13 +529,22 @@ class TargetDetector(Node):
                     1,
                     cv2.LINE_AA,
                 )
-                self.center_pub.publish(out)
-                self.get_logger().debug(
-                    f"detected center=({result.center_x:.1f}, {result.center_y:.1f}) area={result.area:.1f} "
-                    f"vertices={result.vertex_count}"
-                )
-        else:
-            out.data = []
+                if pnp is not None:
+                    cv2.putText(
+                        debug,
+                        f"pnp z={float(pnp.tvec[2]):.2f}m err={pnp.reprojection_error:.1f}px",
+                        (result.bbox_x, result.bbox_y + result.bbox_h + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 0),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+        confirmed = self.update_filter(result, pnp) if self.filter_enable else result is not None
+        if result is not None and confirmed:
+            self.publish_filtered_center(result)
+            self.publish_pose(msg.header, pnp)
 
         if self.publish_debug_image:
             debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding="bgr8")

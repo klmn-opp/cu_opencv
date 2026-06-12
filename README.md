@@ -94,6 +94,30 @@ ros2 launch cu_vision target_detector.launch.py display:=true preview_scale:=0.5
 - `target_shape_mask`: 通过 5 边形筛选后的目标区域
 - `target_debug`: 原图上叠加外接框、中心点和多边形轮廓
 
+输出话题：
+
+- `target_center_px`: 单帧原始检测结果，格式 `[cx, cy, area, vertex_count]`
+- `target_center_px_filtered`: 多帧确认和平滑后的结果，格式 `[cx, cy, area, vertex_count, hit_count]`
+- `target_pose_camera`: PnP 解算出的目标位姿，`geometry_msgs/PoseStamped`
+
+滤波参数：
+
+- `filter_enable`: 是否启用滤波，默认 `true`
+- `min_confirm_frames`: 连续命中多少帧才发布滤波结果，默认 `3`
+- `max_missed_frames`: 允许丢失多少帧后重置跟踪，默认 `5`
+- `filter_alpha`: 指数平滑系数，默认 `0.35`
+- `max_center_jump_px`: 已确认目标允许的最大跳变像素，默认 `220.0`
+
+PnP 参数：
+
+- `enable_pnp`: 是否启用 PnP，默认 `true`
+- `target_side_m`: 靶标边长，默认 `1.0`
+- `max_reprojection_error_px`: PnP 最大重投影误差，默认 `8.0`
+- `camera_info_topic`: 相机内参话题，默认 `/camera_info`
+- `camera_fx` / `camera_fy` / `camera_cx` / `camera_cy`: 手动内参，默认 `0.0`
+
+PnP 需要相机内参。如果相机节点没有发布 `/camera_info`，就从标定文件里读出 `fx/fy/cx/cy`，通过 launch 参数手动传入。
+
 ## QoS
 
 图像订阅使用 `sensor_data` QoS，也就是 `best_effort` 低延迟模式，适配相机节点这类高频图像流。

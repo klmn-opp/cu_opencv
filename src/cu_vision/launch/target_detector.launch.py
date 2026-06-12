@@ -8,6 +8,7 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("image_topic", default_value="/image_raw"),
+            DeclareLaunchArgument("camera_info_topic", default_value="/camera_info"),
             DeclareLaunchArgument("target_color", default_value="red"),
             DeclareLaunchArgument("min_area", default_value="150.0"),
             DeclareLaunchArgument("display", default_value="false"),
@@ -22,6 +23,18 @@ def generate_launch_description():
             DeclareLaunchArgument("min_vertices", default_value="4"),
             DeclareLaunchArgument("max_vertices", default_value="6"),
             DeclareLaunchArgument("min_solidity", default_value="0.65"),
+            DeclareLaunchArgument("filter_enable", default_value="true"),
+            DeclareLaunchArgument("min_confirm_frames", default_value="3"),
+            DeclareLaunchArgument("max_missed_frames", default_value="5"),
+            DeclareLaunchArgument("filter_alpha", default_value="0.35"),
+            DeclareLaunchArgument("max_center_jump_px", default_value="220.0"),
+            DeclareLaunchArgument("enable_pnp", default_value="true"),
+            DeclareLaunchArgument("target_side_m", default_value="1.0"),
+            DeclareLaunchArgument("max_reprojection_error_px", default_value="8.0"),
+            DeclareLaunchArgument("camera_fx", default_value="0.0"),
+            DeclareLaunchArgument("camera_fy", default_value="0.0"),
+            DeclareLaunchArgument("camera_cx", default_value="0.0"),
+            DeclareLaunchArgument("camera_cy", default_value="0.0"),
             Node(
                 package="cu_vision",
                 executable="target_detector",
@@ -30,6 +43,7 @@ def generate_launch_description():
                 parameters=[
                     {
                         "image_topic": LaunchConfiguration("image_topic"),
+                        "camera_info_topic": LaunchConfiguration("camera_info_topic"),
                         "target_color": LaunchConfiguration("target_color"),
                         "min_area": LaunchConfiguration("min_area"),
                         "display": LaunchConfiguration("display"),
@@ -44,6 +58,18 @@ def generate_launch_description():
                         "min_vertices": LaunchConfiguration("min_vertices"),
                         "max_vertices": LaunchConfiguration("max_vertices"),
                         "min_solidity": LaunchConfiguration("min_solidity"),
+                        "filter_enable": LaunchConfiguration("filter_enable"),
+                        "min_confirm_frames": LaunchConfiguration("min_confirm_frames"),
+                        "max_missed_frames": LaunchConfiguration("max_missed_frames"),
+                        "filter_alpha": LaunchConfiguration("filter_alpha"),
+                        "max_center_jump_px": LaunchConfiguration("max_center_jump_px"),
+                        "enable_pnp": LaunchConfiguration("enable_pnp"),
+                        "target_side_m": LaunchConfiguration("target_side_m"),
+                        "max_reprojection_error_px": LaunchConfiguration("max_reprojection_error_px"),
+                        "camera_fx": LaunchConfiguration("camera_fx"),
+                        "camera_fy": LaunchConfiguration("camera_fy"),
+                        "camera_cx": LaunchConfiguration("camera_cx"),
+                        "camera_cy": LaunchConfiguration("camera_cy"),
                     }
                 ],
             ),
