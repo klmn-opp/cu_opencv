@@ -12,7 +12,7 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, String
 
 
 @dataclass
@@ -357,6 +357,7 @@ class TargetDetector(Node):
         self.mask_pub = self.create_publisher(Image, "target_mask", qos_profile_sensor_data)
         self.shape_mask_pub = self.create_publisher(Image, "target_shape_mask", qos_profile_sensor_data)
         self.debug_pub = self.create_publisher(Image, "target_debug", qos_profile_sensor_data)
+        self.status_pub = self.create_publisher(String, "target_pose_status", 10)
 
         self.get_logger().info(
             f"listening on {image_topic}, target_color={self.target_color}, min_area={self.min_area}, "
@@ -370,7 +371,7 @@ class TargetDetector(Node):
         self.dist_coeffs = np.array(msg.d, dtype=np.float64).reshape(-1, 1) if msg.d else np.zeros((5, 1), dtype=np.float64)
         self.get_logger().info("camera intrinsics received from CameraInfo")
 
-    def update_filter(self, result: Optional[DetectionResult], pnp: Optional[PnPResult]) -> bool:
+    def update_filter(self, result: Optional[DetectionResult], pnp: Optional[PnPResult]) -> tuple[bool, str]:
         if result is None:
             self.missed_count += 1
             if self.missed_count > self.max_missed_frames:
@@ -378,14 +379,14 @@ class TargetDetector(Node):
                 self.filtered_tvec = None
                 self.filtered_rvec = None
                 self.hit_count = 0
-            return False
+            return False, "no_detection"
 
         center = np.array([result.center_x, result.center_y], dtype=np.float64)
         if self.filtered_center is not None and self.max_center_jump_px > 0.0:
             jump = float(np.linalg.norm(center - self.filtered_center))
             if self.hit_count >= self.min_confirm_frames and jump > self.max_center_jump_px:
                 self.missed_count += 1
-                return False
+                return False, "jump_rejected"
 
         alpha = min(max(self.filter_alpha, 0.0), 1.0)
         if self.filtered_center is None or self.missed_count > self.max_missed_frames:
@@ -403,17 +404,23 @@ class TargetDetector(Node):
 
         self.hit_count += 1
         self.missed_count = 0
-        return self.hit_count >= self.min_confirm_frames
+        if self.hit_count >= self.min_confirm_frames:
+            return True, "confirmed"
+        return False, "waiting_confirm"
 
-    def solve_target_pnp(self, contour: np.ndarray) -> Optional[PnPResult]:
+    def solve_target_pnp(self, contour: np.ndarray) -> tuple[Optional[PnPResult], str]:
         if not self.enable_pnp or self.camera_matrix is None:
-            return None
+            if not self.enable_pnp:
+                return None, "pnp_disabled"
+            return None, "no_camera_matrix"
 
         pentagon = find_pentagon_approx(contour, self.shape_epsilon_ratio)
         if pentagon is None:
-            return None
+            return None, "no_pentagon"
 
         best: Optional[PnPResult] = None
+        saw_ok = False
+        saw_reprojection_candidate = False
         for image_points in pentagon_point_orders(pentagon):
             ok, rvec, tvec = cv2.solvePnP(
                 self.object_points,
@@ -424,14 +431,22 @@ class TargetDetector(Node):
             )
             if not ok:
                 continue
+            saw_ok = True
             projected, _ = cv2.projectPoints(self.object_points, rvec, tvec, self.camera_matrix, self.dist_coeffs)
             projected = projected.reshape(-1, 2)
             error = float(np.mean(np.linalg.norm(projected - image_points, axis=1)))
             if error > self.max_reprojection_error_px:
+                saw_reprojection_candidate = True
                 continue
             if best is None or error < best.reprojection_error:
                 best = PnPResult(rvec=rvec, tvec=tvec, reprojection_error=error, image_points=image_points)
-        return best
+        if best is not None:
+            return best, "ok"
+        if not saw_ok:
+            return None, "solvepnp_failed"
+        if saw_reprojection_candidate:
+            return None, "reprojection_too_high"
+        return None, "no_valid_solution"
 
     def publish_filtered_center(self, result: DetectionResult) -> None:
         if self.filtered_center is None:
@@ -446,9 +461,11 @@ class TargetDetector(Node):
         ]
         self.filtered_center_pub.publish(msg)
 
-    def publish_pose(self, header, pnp: Optional[PnPResult]) -> None:
+    def publish_pose(self, header, pnp: Optional[PnPResult]) -> tuple[bool, str]:
         if pnp is None or self.filtered_tvec is None or self.filtered_rvec is None:
-            return
+            if pnp is None:
+                return False, "no_pnp"
+            return False, "no_filtered_pose"
         rotation, _ = cv2.Rodrigues(self.filtered_rvec)
         qx, qy, qz, qw = rotation_matrix_to_quaternion(rotation)
 
@@ -464,6 +481,12 @@ class TargetDetector(Node):
         msg.pose.orientation.z = qz
         msg.pose.orientation.w = qw
         self.pose_pub.publish(msg)
+        return True, "ok"
+
+    def publish_status(self, **fields) -> None:
+        msg = String()
+        msg.data = " ".join(f"{key}={value}" for key, value in fields.items())
+        self.status_pub.publish(msg)
 
     def image_callback(self, msg: Image) -> None:
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -494,11 +517,21 @@ class TargetDetector(Node):
         shape_mask = np.zeros(mask.shape, dtype=np.uint8)
         result = None
         pnp = None
+        pnp_reason = "not_attempted"
+        status_stage = "no_contour"
+        status_reason = "no_contour"
+        pose_sent = False
+        pose_reason = "not_attempted"
 
         if contour is not None:
             result = contour_center(contour, approx)
             if result is not None:
-                pnp = self.solve_target_pnp(contour)
+                status_stage = "detected"
+                pnp, pnp_reason = self.solve_target_pnp(contour)
+                if pnp is None:
+                    status_stage = "pnp_failed"
+                else:
+                    status_stage = "pnp_ok"
                 cv2.drawContours(shape_mask, [contour], -1, 255, thickness=cv2.FILLED)
                 self.last_detection = result
 
@@ -541,10 +574,62 @@ class TargetDetector(Node):
                         cv2.LINE_AA,
                     )
 
-        confirmed = self.update_filter(result, pnp) if self.filter_enable else result is not None
+        if self.filter_enable:
+            confirmed, filter_reason = self.update_filter(result, pnp)
+        else:
+            confirmed = result is not None
+            filter_reason = "disabled"
+            if result is not None:
+                self.filtered_center = np.array([result.center_x, result.center_y], dtype=np.float64)
+                if pnp is not None:
+                    self.filtered_tvec = pnp.tvec.astype(np.float64)
+                    self.filtered_rvec = pnp.rvec.astype(np.float64)
+                self.hit_count += 1
+                self.missed_count = 0
         if result is not None and confirmed:
             self.publish_filtered_center(result)
-            self.publish_pose(msg.header, pnp)
+            pose_sent, pose_reason = self.publish_pose(msg.header, pnp)
+            status_stage = "published" if pose_sent else "confirmed_no_pose"
+            status_reason = pose_reason
+        elif result is not None:
+            if self.filter_enable and self.hit_count < self.min_confirm_frames:
+                status_stage = "waiting_confirm"
+                status_reason = filter_reason
+            elif self.filter_enable and filter_reason == "jump_rejected":
+                status_stage = "jump_rejected"
+                status_reason = filter_reason
+            elif pnp is None:
+                status_stage = "pnp_failed"
+                status_reason = pnp_reason
+            else:
+                status_stage = "filtered_blocked"
+                status_reason = filter_reason
+
+        self.publish_status(
+            stage=status_stage,
+            reason=status_reason,
+            contour=int(contour is not None),
+            contours=int(len(contours)),
+            mask_pixels=int(cv2.countNonZero(mask)),
+            detected=int(result is not None),
+            pnp=int(pnp is not None),
+            pnp_reason=pnp_reason,
+            filter_enable=int(self.filter_enable),
+            filter_reason=filter_reason,
+            confirmed=int(confirmed),
+            pose_sent=int(pose_sent),
+            pose_reason=pose_reason,
+            hit_count=int(self.hit_count),
+            missed_count=int(self.missed_count),
+            min_confirm_frames=int(self.min_confirm_frames),
+            max_missed_frames=int(self.max_missed_frames),
+            max_center_jump_px=float(self.max_center_jump_px),
+            enable_pnp=int(self.enable_pnp),
+            camera_ready=int(self.camera_matrix is not None),
+            selected_area=float(result.area) if result is not None else 0.0,
+            selected_vertices=int(result.vertex_count) if result is not None else 0,
+            pnp_error=float(pnp.reprojection_error) if pnp is not None else -1.0,
+        )
 
         if self.publish_debug_image:
             debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding="bgr8")
