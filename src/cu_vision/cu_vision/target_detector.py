@@ -528,6 +528,7 @@ class TargetDetector(Node):
             if result is not None:
                 status_stage = "detected"
                 pnp, pnp_reason = self.solve_target_pnp(contour)
+                status_reason = pnp_reason
                 if pnp is None:
                     status_stage = "pnp_failed"
                 else:
